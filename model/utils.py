@@ -6,6 +6,7 @@ import json
 import time
 import random
 import os
+import sys
 import re
 import numpy as np
 import torch
@@ -26,7 +27,16 @@ def record_time(name):
 
 class TOKENIZER():
     def __init__(self, WORD_NAME):
-        self.tokenizer = Tokenizer.from_file(WORD_NAME)
+        if WORD_NAME == 'rwkv_vocab_v20230424':
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from rwkv_tokenizer import TRIE_TOKENIZER
+            dirname = os.path.dirname(os.path.abspath(__file__))
+            self.tokenizer = TRIE_TOKENIZER(dirname + '/rwkv_vocab_v20230424.txt')
+        else:
+            self.tokenizer = Tokenizer.from_file(WORD_NAME)
+
+    def is_trie(self):
+        return 'Tokenizer' not in str(type(self.tokenizer))
 
     def refine_context(self, context):
         context = context.strip().split('\n')
@@ -39,32 +49,41 @@ class TOKENIZER():
         return context
 
     def encode(self, x):
-        return self.tokenizer.encode(x).ids
+        if not self.is_trie():
+            return self.tokenizer.encode(x).ids
+        else:
+            return self.tokenizer.encode(x)
 
     def decode(self, x):
         return self.tokenizer.decode(x)
 
 
+
 class SAMPLER():
-    def __init__(self, sample, temp, top_p, tau, count_penalty, presence_penalty):
+    def __init__(self, sample, temp, temp_a, top_p, tau, count_penalty, presence_penalty, penalty_range):
         if sample == 'nucleus':
             self.sample = self.sample_nucleus
         elif sample == 'typical':
             self.sample = self.sample_typical
         else:
             raise RuntimeError("\"sample\" must be \"nucleus\" or \"typical\"")
-
+        
         self.temp = temp
         self.top_p = top_p
         self.top_k = 0
         self.tau = tau
         self.count_penalty = count_penalty
         self.presence_penalty = presence_penalty
+        self.penalty_range = penalty_range
+        self.temp_a = temp_a
 
     def __str__(self) -> str:
         method = "Nucleus" if self.sample == self.sample_nucleus else "Typical"
+        print(f"Test: {self.penalty_range}")
         return '''|{:^30}|{:^10}|
 |------------------------------|----------|
+|{:^30}|{:>10}|
+|{:^30}|{:>10}|
 |{:^30}|{:>10}|
 |{:^30}|{:>10}|
 |{:^30}|{:>10}|
@@ -74,12 +93,15 @@ class SAMPLER():
 '''.format("Sampler Params", "Values",
            "Method", method,
            "Temperature", self.temp,
+           "Temperature After Penalty", self.temp_a,
            "Top P", self.top_p,
            "Tau", self.tau,
            "Count Penalty", self.count_penalty,
-           "Presence Penalty", self.presence_penalty)
+           "Presence Penalty", self.presence_penalty,
+           "Penalty Range", self.penalty_range)
 
     def parse(self, input: str) -> str:
+        temp_a_match = re.search("(\-temp_a\s*=\s*)(\-?\d+(.\d*)?)\s*", input)
         nucleus_match = re.search("\-nucleus\s+", input)
         typical_match = re.search("\-typical\s+", input)
         temp_match = re.search("(\-temp\s*=\s*)(\-?\d+(.\d*)?)\s*", input)
@@ -87,7 +109,11 @@ class SAMPLER():
         tau_match = re.search("(\-tau\s*=\s*)(\-?\d+(.\d*)?)\s*", input)
         af_match = re.search("(\-af\s*=\s*)(\-?\d+(.\d*)?)\s*", input)
         ap_match = re.search("(\-ap\s*=\s*)(\-?\d+(.\d*)?)\s*", input)
-
+        ar_match = re.search("(\-ar\s*=\s*)(\d+)\s*", input)
+        
+        if temp_a_match:
+            self.temp_a = float(temp_a_match.group(2))
+            input = input.replace(temp_a_match.group(0), "")
         if temp_match:
             self.temp = float(temp_match.group(2))
             input = input.replace(temp_match.group(0), "")
@@ -105,6 +131,9 @@ class SAMPLER():
         if ap_match:
             self.presence_penalty = float(ap_match.group(2))
             input = input.replace(ap_match.group(0), "")
+        if ar_match:
+            self.penalty_range = int(ar_match.group(2))
+            input = input.replace(ar_match.group(0), "")
         if nucleus_match:
             self.sample = self.sample_nucleus
             input = input.replace(nucleus_match.group(0), "")
@@ -115,6 +144,7 @@ class SAMPLER():
         def clamp(n, minimum, maximum):
             return max(minimum, min(n, maximum))
 
+        self.temp_a = clamp(self.temp_a, 0.2, 5)
         self.temp = clamp(self.temp, 0.2, 5)
         self.top_p = max(0, self.top_p)
         self.tau = max(0, self.tau)
@@ -124,6 +154,8 @@ class SAMPLER():
         return input
 
     def sample_nucleus(self, logits):
+        if self.temp_a != 1.0:
+            logits = logits / self.temp_a
         probs = F.softmax(logits.float(), dim=-1)
         if probs.device == torch.device('cpu'):
             probs = probs.numpy()
@@ -156,6 +188,8 @@ class SAMPLER():
             return int(out)
 
     def sample_typical(self, logits):
+        if self.temp_a != 1.0:
+            logits = logits / self.temp_a
         probs = F.softmax(logits.float(), dim=-1)
         logits = -torch.log(probs)
         entropy = torch.nansum(logits * probs, dim=-1, keepdim=True)
